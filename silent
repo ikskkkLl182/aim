@@ -1,0 +1,1507 @@
+-- aim menu: silent aim + FOV circle + target mode (Bots / Players / Both)
+-- menu: K key (PC) or the floating "aim" icon (mobile, draggable)
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = workspace
+
+local LocalPlayer = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+-- phone: touch screen and no keyboard
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+local function notify(title, text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = 10,
+        })
+    end)
+end
+notify("aim", "loading...")
+
+if env.__AimCleanup then
+    pcall(env.__AimCleanup)
+end
+
+local connections = {}
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+---------------------------------------------------------------------
+-- settings (saved to file if the executor supports it)
+---------------------------------------------------------------------
+local CFG_FILE = "aim_menu_cfg.json"
+
+local AIM = {
+    enabled = true,
+    target = "Both",      -- "Bot" | "Player" | "Both"
+    wallbang = false,
+    fovShow = true,
+    fovLimit = true,      -- only aim at targets inside the FOV circle
+    fovRadius = 150,      -- pixels
+}
+local FOV_COLOR = Color3.fromRGB(255, 255, 255)
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(CFG_FILE) then
+            local d = HttpService:JSONDecode(readfile(CFG_FILE))
+            if type(d) == "table" then
+                if type(d.enabled) == "boolean" then AIM.enabled = d.enabled end
+                if d.target == "Bot" or d.target == "Player" or d.target == "Both" then AIM.target = d.target end
+                if type(d.wallbang) == "boolean" then AIM.wallbang = d.wallbang end
+                if type(d.fovShow) == "boolean" then AIM.fovShow = d.fovShow end
+                if type(d.fovLimit) == "boolean" then AIM.fovLimit = d.fovLimit end
+                if type(d.fovRadius) == "number" then AIM.fovRadius = math.clamp(d.fovRadius, 30, 600) end
+                if type(d.color) == "table" and #d.color == 3 then
+                    FOV_COLOR = Color3.fromRGB(d.color[1], d.color[2], d.color[3])
+                end
+            end
+        end
+    end)
+end
+
+local function syncEnv()
+    env.AimTarget = AIM.target
+    env.AimWallbang = AIM.wallbang
+end
+syncEnv()
+
+local function saveCfg()
+    syncEnv()
+    if not writefile then return end
+    pcall(function()
+        writefile(CFG_FILE, HttpService:JSONEncode({
+            enabled = AIM.enabled,
+            target = AIM.target,
+            wallbang = AIM.wallbang,
+            fovShow = AIM.fovShow,
+            fovLimit = AIM.fovLimit,
+            fovRadius = AIM.fovRadius,
+            color = {
+                math.floor(FOV_COLOR.R * 255 + 0.5),
+                math.floor(FOV_COLOR.G * 255 + 0.5),
+                math.floor(FOV_COLOR.B * 255 + 0.5),
+            },
+        }))
+    end)
+end
+
+---------------------------------------------------------------------
+-- aim logic
+---------------------------------------------------------------------
+local function isTargetVisible(cameraPos, targetPos, ignoreList)
+    local direction = (targetPos - cameraPos)
+    local distance = direction.Magnitude
+    if distance <= 0 then
+        return true
+    end
+    direction = direction.Unit
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = ignoreList
+    params.IgnoreWater = true
+
+    local rayResult = Workspace:Raycast(cameraPos, direction * (distance + 0.5), params)
+    if rayResult == nil then
+        return true
+    end
+
+    local hitInstance = rayResult.Instance
+    if math.abs(rayResult.Distance - distance) < 1 then
+        return true
+    end
+
+    local current = hitInstance
+    while current do
+        if current:IsA("Model") and current:FindFirstChild("HumanoidRootPart") then
+            return true
+        end
+        current = current.Parent
+    end
+
+    return false
+end
+
+local function getBestTarget()
+    local Camera = Workspace.CurrentCamera
+    if not Camera then
+        return {}
+    end
+    local character = LocalPlayer.Character
+    if not character then
+        return {}
+    end
+    local primaryPart = character.PrimaryPart
+    if not primaryPart then
+        return {}
+    end
+
+    local cameraPos = Camera.CFrame.Position
+    -- viewport coordinates (same space as the FOV circle, which lives in an IgnoreGuiInset gui)
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
+    local ignoreList = {character}
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("Tool") then
+            table.insert(ignoreList, child)
+        end
+    end
+
+    local allTargets = {}
+
+    local function addTarget(charModel, hrp, isVisible)
+        table.insert(allTargets, {
+            character = charModel,
+            hrp = hrp,
+            isVisible = isVisible
+        })
+    end
+
+    if AIM.target == "Bot" or AIM.target == "Both" then
+        local missionsFolder = Workspace:FindFirstChild("Missions")
+        if missionsFolder then
+            for _, mission in ipairs(missionsFolder:GetChildren()) do
+                local aiSpawners = mission:FindFirstChild("AISpawners")
+                if aiSpawners then
+                    for _, spawner in ipairs(aiSpawners:GetChildren()) do
+                        local botModel = spawner:FindFirstChildWhichIsA("Model")
+                        if botModel then
+                            local humanoid = botModel:FindFirstChildOfClass("Humanoid")
+                            local hrp = botModel:FindFirstChild("HumanoidRootPart")
+                            if humanoid and hrp and humanoid.Health > 0 then
+                                local visible = isTargetVisible(cameraPos, hrp.Position, ignoreList)
+                                if visible then
+                                    addTarget(botModel, hrp, true)
+                                elseif AIM.wallbang then
+                                    addTarget(botModel, hrp, false)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if AIM.target == "Player" or AIM.target == "Both" then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local targetChar = player.Character
+                if targetChar then
+                    local humanoid = targetChar:FindFirstChildOfClass("Humanoid")
+                    local hrp = targetChar:FindFirstChild("HumanoidRootPart")
+                    if humanoid and hrp and humanoid.Health > 0 then
+                        table.insert(ignoreList, targetChar)
+                        local visible = isTargetVisible(cameraPos, hrp.Position, ignoreList)
+                        if visible then
+                            addTarget(targetChar, hrp, true)
+                        elseif AIM.wallbang then
+                            addTarget(targetChar, hrp, false)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local targetsWithDist = {}
+    for _, target in ipairs(allTargets) do
+        local screenPos, onScreen = Camera:WorldToViewportPoint(target.hrp.Position)
+        if onScreen and screenPos.Z > 0 then
+            local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+            if (not AIM.fovLimit) or dist <= AIM.fovRadius then
+                target.screenDist = dist
+                table.insert(targetsWithDist, target)
+            end
+        end
+    end
+
+    table.sort(targetsWithDist, function(a, b)
+        if a.isVisible ~= b.isVisible then
+            return a.isVisible
+        end
+        return a.screenDist < b.screenDist
+    end)
+
+    local result = {}
+    for _, target in ipairs(targetsWithDist) do
+        table.insert(result, target.character)
+    end
+
+    return result
+end
+
+local function safeBest()
+    if not AIM.enabled then return {} end
+    local ok, res = pcall(getBestTarget)
+    if ok and type(res) == "table" then return res end
+    return {}
+end
+
+-- hooks (game-specific modules; if they are missing the menu still works and shows the status)
+local hookStatus = "hooks: not installed"
+local okHooks, errHooks = pcall(function()
+    local RaycastModule = require(ReplicatedStorage.Modules.Tool.Gun.Raycast)
+    local GetMouseHitModule = require(ReplicatedStorage.Modules.Tool.Raw.GetMouseHit)
+    pcall(restorefunction, RaycastModule.FireRay)
+    pcall(restorefunction, GetMouseHitModule)
+
+    local FireRay; FireRay = hookfunction(RaycastModule.FireRay, function(p1, p2, p3, p4, p5, p6, p7, p8)
+        local bestTargets = safeBest()
+        if #bestTargets > 0 then
+            local v1, v2, v3, v4
+            local target = bestTargets
+            v1 = {target[1].HumanoidRootPart.Position}
+            v2 = {}
+            v3 = {}
+            for _, v in ipairs(target) do
+                table.insert(v2, {
+                    v,
+                    target[1].HumanoidRootPart.Position,
+                    (target[1].HumanoidRootPart.Position - Players.LocalPlayer.Character.PrimaryPart.Position).Unit,
+                    "Humanoid"
+                })
+                table.insert(v3, v.Humanoid)
+            end
+            v4 = {}
+            return v1, v2, v3, v4
+        else
+            return FireRay(p1, p2, p3, p4, p5, p6, p7, p8)
+        end
+    end)
+
+    local GetMouseHit; GetMouseHit = hookfunction(GetMouseHitModule, function(p1)
+        local bestTargets = safeBest()
+        if #bestTargets > 0 then
+            return bestTargets[1].HumanoidRootPart.Position
+        else
+            return GetMouseHit(p1)
+        end
+    end)
+end)
+hookStatus = okHooks and "hooks: installed" or ("hooks: FAILED - " .. tostring(errHooks))
+
+local function buildUI()
+---------------------------------------------------------------------
+-- ui helpers
+---------------------------------------------------------------------
+local THEME = {
+    bg = Color3.fromRGB(14, 14, 22),
+    panel = Color3.fromRGB(21, 21, 33),
+    item = Color3.fromRGB(30, 30, 46),
+    hover = Color3.fromRGB(44, 44, 66),
+    text = Color3.fromRGB(235, 235, 245),
+    dim = Color3.fromRGB(140, 140, 165),
+    accent = Color3.fromRGB(140, 90, 255),
+    accent2 = Color3.fromRGB(60, 200, 255),
+    off = Color3.fromRGB(58, 58, 80),
+    danger = Color3.fromRGB(255, 80, 100),
+}
+
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    if props then
+        for k, v in pairs(props) do
+            inst[k] = v
+        end
+    end
+    if parent then
+        inst.Parent = parent
+    end
+    return inst
+end
+
+local function corner(obj, radius)
+    return new("UICorner", {CornerRadius = UDim.new(0, radius)}, obj)
+end
+
+local function tween(obj, props, time, style)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(time or 0.25, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        props
+    ):Play()
+end
+
+local function isPointer(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(input)
+    return input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local layoutCounter = 0
+local function nextOrder()
+    layoutCounter = layoutCounter + 1
+    return layoutCounter
+end
+
+---------------------------------------------------------------------
+-- keybinds (saved to file)
+---------------------------------------------------------------------
+local BIND_FILE = "aim_menu_binds.json"
+local savedBinds = {}
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(BIND_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(BIND_FILE))
+            if type(decoded) == "table" then
+                savedBinds = decoded
+            end
+        end
+    end)
+end
+
+local binds = {}
+local bindActions = {}
+local bindRefresh = {}
+local listeningId = nil
+
+local function saveBinds()
+    if not writefile then return end
+    local data = {}
+    for id, key in pairs(binds) do
+        data[id] = key and key.Name or ""
+    end
+    pcall(function()
+        writefile(BIND_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+local function keyText(key)
+    if not key then return "None" end
+    local n = key.Name
+    n = string.gsub(n, "Control", "Ctrl")
+    n = string.gsub(n, "^Left", "L")
+    n = string.gsub(n, "^Right", "R")
+    return n
+end
+
+local function registerBind(id, defaultKey, action)
+    local resolved = defaultKey or false
+    local saved = savedBinds[id]
+    if type(saved) == "string" then
+        if saved == "" then
+            resolved = false
+        else
+            local ok, key = pcall(function() return Enum.KeyCode[saved] end)
+            if ok and key then resolved = key end
+        end
+    end
+    binds[id] = resolved
+    bindActions[id] = action
+end
+
+local function makeBindButton(parent, id, position)
+    local btn = new("TextButton", {
+        Size = UDim2.fromOffset(72, 24),
+        Position = position,
+        BackgroundColor3 = THEME.bg,
+        AutoButtonColor = false,
+        Text = keyText(binds[id]),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = THEME.accent2,
+    }, parent)
+    corner(btn, 6)
+    local st = new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.off,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, btn)
+
+    local function refresh()
+        local listening = listeningId == id
+        btn.Text = listening and "..." or keyText(binds[id])
+        btn.TextColor3 = listening and THEME.text or (binds[id] and THEME.accent2 or THEME.dim)
+        tween(st, {Color = listening and THEME.accent or THEME.off}, 0.15)
+    end
+
+    bindRefresh[id] = refresh
+
+    connect(btn.Activated, function()
+        local prev = listeningId
+        if listeningId == id then
+            listeningId = nil
+        else
+            listeningId = id
+        end
+        if prev and bindRefresh[prev] then bindRefresh[prev]() end
+        refresh()
+    end)
+
+    refresh()
+end
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if listeningId then
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local id = listeningId
+        listeningId = nil
+        if input.KeyCode == Enum.KeyCode.Escape then
+        elseif input.KeyCode == Enum.KeyCode.Backspace then
+            binds[id] = false
+        else
+            for otherId, key in pairs(binds) do
+                if otherId ~= id and key == input.KeyCode then
+                    binds[otherId] = false
+                    if bindRefresh[otherId] then bindRefresh[otherId]() end
+                end
+            end
+            binds[id] = input.KeyCode
+        end
+        if bindRefresh[id] then bindRefresh[id]() end
+        saveBinds()
+        return
+    end
+
+    if processed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    for id, key in pairs(binds) do
+        if key and key == input.KeyCode then
+            local action = bindActions[id]
+            if action then pcall(action) end
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- gui root + FOV circle
+---------------------------------------------------------------------
+local gui = new("ScreenGui", {
+    Name = "AimMenu",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+local function mount()
+    local targets = {
+        function() return LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5) end,
+        function() return gethui and gethui() end,
+        function() return game:GetService("CoreGui") end,
+    }
+    for _, get in ipairs(targets) do
+        local ok, parent = pcall(get)
+        if ok and parent then
+            local ok2 = pcall(function() gui.Parent = parent end)
+            if ok2 and gui.Parent then return end
+        end
+    end
+end
+mount()
+
+-- FOV circle: a round frame centred on the screen, same centre the aim logic uses
+local fovFrame = new("Frame", {
+    Name = "FOV",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(AIM.fovRadius * 2, AIM.fovRadius * 2),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Active = false,
+    Visible = false,
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(1, 0)}, fovFrame)
+local fovStroke = new("UIStroke", {
+    Thickness = 2,
+    Color = FOV_COLOR,
+    Transparency = 0.15,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, fovFrame)
+
+local function fovRefresh()
+    fovFrame.Size = UDim2.fromOffset(AIM.fovRadius * 2, AIM.fovRadius * 2)
+    fovStroke.Color = FOV_COLOR
+    fovFrame.Visible = AIM.fovShow and AIM.enabled
+end
+fovRefresh()
+
+---------------------------------------------------------------------
+-- menu window (scaled down on small / mobile screens)
+---------------------------------------------------------------------
+local function baseScale()
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    return math.clamp(math.min((vp.X - 20) / 380, (vp.Y - 20) / 470), 0.45, 1)
+end
+
+local main = new("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(380, 470),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.bg,
+    BorderSizePixel = 0,
+    Active = true,
+}, gui)
+corner(main, 14)
+new("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(28, 20, 48), THEME.bg),
+    Rotation = 60,
+}, main)
+
+local scale = new("UIScale", {Scale = 0}, main)
+
+local mainStroke = new("UIStroke", {
+    Thickness = 2,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    Color = Color3.new(1, 1, 1),
+}, main)
+local strokeGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, mainStroke)
+
+local topbar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Active = true,
+}, main)
+
+local title = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(18, 0),
+    Size = UDim2.fromOffset(70, 44),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 20,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.new(1, 1, 1),
+    Text = "aim",
+}, topbar)
+new("UIGradient", {Color = ColorSequence.new(THEME.accent, THEME.accent2)}, title)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(70, 3),
+    Size = UDim2.fromOffset(220, 44),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "silent aim  |  K - menu",
+}, topbar)
+
+local closeBtn = new("TextButton", {
+    Size = UDim2.fromOffset(28, 28),
+    Position = UDim2.new(1, -42, 0, 8),
+    BackgroundColor3 = THEME.item,
+    AutoButtonColor = false,
+    Text = "X",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = THEME.dim,
+}, topbar)
+corner(closeBtn, 8)
+
+connect(closeBtn.MouseEnter, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.danger, TextColor3 = Color3.new(1, 1, 1)}, 0.15)
+end)
+connect(closeBtn.MouseLeave, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.item, TextColor3 = THEME.dim}, 0.15)
+end)
+
+local topLine = new("Frame", {
+    Position = UDim2.fromOffset(10, 44),
+    Size = UDim2.new(1, -20, 0, 2),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+corner(topLine, 1)
+new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, topLine)
+
+local page = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, 56),
+    Size = UDim2.new(1, -20, 1, -86),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = THEME.accent,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, main)
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, page)
+new("UIPadding", {
+    PaddingRight = UDim.new(0, 6),
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 6),
+}, page)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 14, 1, -26),
+    Size = UDim2.new(1, -28, 0, 20),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "Tap key button to rebind  |  Backspace - clear  |  Esc - cancel",
+}, main)
+
+local function addSection(text)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.dim,
+        Text = string.upper(text),
+        LayoutOrder = nextOrder(),
+    }, page)
+end
+
+local function addToggle(text, default, callback, bindId, defaultKey)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, bindId and -158 or -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local track = new("Frame", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 11)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local click = new("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+
+    local state = default and true or false
+    local obj = {}
+
+    local function render()
+        tween(track, {BackgroundColor3 = state and THEME.accent or THEME.off}, 0.2)
+        tween(knob, {Position = state and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)}, 0.2, Enum.EasingStyle.Back)
+    end
+
+    function obj.set(v)
+        state = v and true or false
+        render()
+        pcall(callback, state)
+    end
+
+    function obj.get()
+        return state
+    end
+
+    connect(click.Activated, function()
+        obj.set(not state)
+    end)
+
+    if bindId then
+        registerBind(bindId, defaultKey, function()
+            obj.set(not state)
+        end)
+        makeBindButton(row, bindId, UDim2.new(1, -136, 0.5, -12))
+    end
+
+    render()
+    return obj
+end
+
+local function addBindRow(text, id, defaultKey, action)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -100, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+    registerBind(id, defaultKey, action)
+    makeBindButton(row, id, UDim2.new(1, -86, 0.5, -12))
+end
+
+local function addButton(text, callback)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundColor3 = THEME.item,
+        AutoButtonColor = false,
+        Text = text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextColor3 = THEME.text,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(btn, 8)
+
+    connect(btn.MouseEnter, function()
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.15)
+    end)
+    connect(btn.MouseLeave, function()
+        tween(btn, {BackgroundColor3 = THEME.item}, 0.15)
+    end)
+    connect(btn.Activated, function()
+        btn.BackgroundColor3 = THEME.accent
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.3)
+        pcall(callback)
+    end)
+    return btn
+end
+
+-- segmented selector: options = {{label, value}, ...}
+local function addSegment(options, current, callback)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
+        PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
+    }, row)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, row)
+
+    local buttons = {}
+    local function render(value)
+        for _, b in ipairs(buttons) do
+            local on = b.value == value
+            tween(b.btn, {BackgroundColor3 = on and THEME.accent or THEME.bg}, 0.15)
+            b.btn.TextColor3 = on and Color3.new(1, 1, 1) or THEME.dim
+        end
+    end
+
+    local width = 1 / #options
+    for i, opt in ipairs(options) do
+        local btn = new("TextButton", {
+            Size = UDim2.new(width, -4 * (#options - 1) / #options, 1, 0),
+            BackgroundColor3 = THEME.bg,
+            AutoButtonColor = false,
+            Text = opt[1],
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            TextColor3 = THEME.dim,
+            LayoutOrder = i,
+        }, row)
+        corner(btn, 6)
+        table.insert(buttons, {btn = btn, value = opt[2]})
+        connect(btn.Activated, function()
+            render(opt[2])
+            pcall(callback, opt[2])
+        end)
+    end
+    render(current)
+end
+
+-- slider row; the page stops scrolling while the slider is dragged (touch)
+local function addSlider(text, minV, maxV, default, onChange, onDone)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 56),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 4),
+        Size = UDim2.new(1, -90, 0, 22),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+    local valLabel = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -74, 0, 4),
+        Size = UDim2.fromOffset(60, 22),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = THEME.accent2,
+        Text = "",
+    }, row)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(14, 36),
+        Size = UDim2.new(1, -28, 0, 8),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+        Active = true,
+    }, row)
+    corner(track, 4)
+    local fill = new("Frame", {
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 4)
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(18, 18),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 9)
+
+    local function setValue(v)
+        v = math.clamp(math.floor(v + 0.5), minV, maxV)
+        local a = (v - minV) / (maxV - minV)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.fromScale(a, 0.5)
+        valLabel.Text = tostring(v)
+        return v
+    end
+    setValue(default)
+
+    local dragging = false
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local a = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        local v = setValue(minV + a * (maxV - minV))
+        pcall(onChange, v)
+    end
+
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            dragging = true
+            page.ScrollingEnabled = false
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if dragging and isPointer(input) then
+            dragging = false
+            page.ScrollingEnabled = true
+            if onDone then pcall(onDone) end
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- color picker popup (HSV sliders, works with touch)
+---------------------------------------------------------------------
+local picker = new("Frame", {
+    Name = "ColorPicker",
+    Size = UDim2.fromOffset(330, 300),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    Active = true,
+    ZIndex = 10,
+}, main)
+corner(picker, 12)
+new("UIStroke", {
+    Thickness = 2,
+    Color = THEME.accent,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, picker)
+
+local pickerTitle = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 10),
+    Size = UDim2.new(1, -90, 0, 22),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.text,
+    Text = "FOV color",
+}, picker)
+
+local preview = new("Frame", {
+    Position = UDim2.new(1, -60, 0, 10),
+    Size = UDim2.fromOffset(44, 22),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, picker)
+corner(preview, 6)
+
+local function makeSlider(parent, y, labelText, onChange)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(16, y),
+        Size = UDim2.fromOffset(20, 20),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = THEME.dim,
+        Text = labelText,
+    }, parent)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(40, y + 4),
+        Size = UDim2.new(1, -62, 0, 12),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Active = true,
+    }, parent)
+    corner(track, 6)
+    local grad = new("UIGradient", nil, track)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(10, 20),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 4)
+    new("UIStroke", {Thickness = 1.5, Color = Color3.new(0, 0, 0)}, knob)
+
+    local s = {grad = grad}
+    local dragging = false
+
+    function s.set(v)
+        knob.Position = UDim2.fromScale(math.clamp(v, 0, 1), 0.5)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local v = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        s.set(v)
+        onChange(v)
+    end
+
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if isPointer(input) then
+            dragging = false
+        end
+    end)
+
+    return s
+end
+
+local hsv = {0, 1, 1}
+local hueS, satS, valS
+local colorSwatch = nil
+
+local rgbLabel = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 142),
+    Size = UDim2.new(1, -32, 0, 18),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "",
+}, picker)
+
+local function pickerRender()
+    local h, s, v = hsv[1], hsv[2], hsv[3]
+    local c = Color3.fromHSV(h, s, v)
+    preview.BackgroundColor3 = c
+    satS.grad.Color = ColorSequence.new(Color3.fromHSV(h, 0, v), Color3.fromHSV(h, 1, v))
+    valS.grad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
+    rgbLabel.Text = string.format(
+        "RGB: %d, %d, %d",
+        math.floor(c.R * 255 + 0.5),
+        math.floor(c.G * 255 + 0.5),
+        math.floor(c.B * 255 + 0.5)
+    )
+end
+
+local function pickerApply()
+    FOV_COLOR = Color3.fromHSV(hsv[1], hsv[2], hsv[3])
+    if colorSwatch then colorSwatch.BackgroundColor3 = FOV_COLOR end
+    fovRefresh()
+    pickerRender()
+end
+
+local rainbowKeys = {}
+for i = 0, 6 do
+    table.insert(rainbowKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1)))
+end
+
+hueS = makeSlider(picker, 48, "H", function(v) hsv[1] = v pickerApply() end)
+hueS.grad.Color = ColorSequence.new(rainbowKeys)
+satS = makeSlider(picker, 80, "S", function(v) hsv[2] = v pickerApply() end)
+valS = makeSlider(picker, 112, "V", function(v) hsv[3] = v pickerApply() end)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 168),
+    Size = UDim2.fromOffset(100, 16),
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "PRESET COLORS",
+}, picker)
+
+local PRESETS = {
+    Color3.fromRGB(255, 60, 60),
+    Color3.fromRGB(255, 160, 60),
+    Color3.fromRGB(255, 220, 60),
+    Color3.fromRGB(80, 255, 130),
+    Color3.fromRGB(60, 200, 255),
+    Color3.fromRGB(140, 90, 255),
+    Color3.fromRGB(255, 100, 220),
+    Color3.fromRGB(255, 255, 255),
+}
+
+local function pickerLoad(color)
+    local h, s, v = color:ToHSV()
+    hsv = {h, s, v}
+    hueS.set(h)
+    satS.set(s)
+    valS.set(v)
+end
+
+for i, col in ipairs(PRESETS) do
+    local b = new("TextButton", {
+        Position = UDim2.fromOffset(16 + (i - 1) * 38, 190),
+        Size = UDim2.fromOffset(30, 30),
+        BackgroundColor3 = col,
+        AutoButtonColor = false,
+        Text = "",
+    }, picker)
+    corner(b, 8)
+    connect(b.Activated, function()
+        pickerLoad(col)
+        pickerApply()
+    end)
+end
+
+local function closePicker()
+    if picker.Visible then
+        picker.Visible = false
+        saveCfg()
+    end
+end
+
+local doneBtn = new("TextButton", {
+    Position = UDim2.fromOffset(16, 244),
+    Size = UDim2.new(1, -32, 0, 38),
+    BackgroundColor3 = THEME.accent,
+    AutoButtonColor = false,
+    Text = "Done",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+}, picker)
+corner(doneBtn, 8)
+connect(doneBtn.Activated, closePicker)
+
+local function openPicker()
+    pickerLoad(FOV_COLOR)
+    pickerRender()
+    picker.Visible = true
+end
+
+local function addColorRow(text)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    colorSwatch = new("TextButton", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = FOV_COLOR,
+        AutoButtonColor = false,
+        Text = "",
+    }, row)
+    corner(colorSwatch, 6)
+    new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.text,
+        Transparency = 0.6,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, colorSwatch)
+
+    connect(colorSwatch.Activated, openPicker)
+end
+
+---------------------------------------------------------------------
+-- open / close menu (cursor restored on close)
+---------------------------------------------------------------------
+local opened = not IS_MOBILE   -- on a phone the menu starts closed, the icon opens it
+main.Visible = opened
+
+local modalBtn = new("TextButton", {
+    Size = UDim2.fromOffset(0, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    Modal = not IS_MOBILE,
+}, main)
+
+local prevMouseIcon = UserInputService.MouseIconEnabled
+local prevMouseBehavior = UserInputService.MouseBehavior
+local mouseForced = false
+
+local function mouseRelease()
+    if not mouseForced then
+        prevMouseIcon = UserInputService.MouseIconEnabled
+        prevMouseBehavior = UserInputService.MouseBehavior
+        mouseForced = true
+    end
+end
+
+local gameBehavior, gameIcon = nil, nil
+connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
+    if opened and mouseForced then
+        local v = UserInputService.MouseBehavior
+        if v ~= Enum.MouseBehavior.Default then gameBehavior = v end
+    end
+end)
+connect(UserInputService:GetPropertyChangedSignal("MouseIconEnabled"), function()
+    if opened and mouseForced and UserInputService.MouseIconEnabled == false then
+        gameIcon = false
+    end
+end)
+
+local function mouseRestore()
+    if not mouseForced then return end
+    mouseForced = false
+    local behavior = gameBehavior or prevMouseBehavior
+    local iconOn = prevMouseIcon
+    if gameIcon ~= nil then iconOn = gameIcon end
+    gameBehavior, gameIcon = nil, nil
+    if LocalPlayer.CameraMode == Enum.CameraMode.LockFirstPerson then
+        behavior = Enum.MouseBehavior.LockCenter
+        iconOn = false
+    end
+    UserInputService.MouseIconEnabled = iconOn
+    UserInputService.MouseBehavior = behavior
+end
+
+local function setOpen(v)
+    opened = v
+    if v then
+        modalBtn.Modal = not IS_MOBILE
+        main.Visible = true
+        tween(scale, {Scale = baseScale()}, 0.35, Enum.EasingStyle.Back)
+    else
+        closePicker()
+        modalBtn.Modal = false
+        mouseRestore()
+        tween(scale, {Scale = 0}, 0.2)
+        task.delay(0.22, function()
+            if not opened then main.Visible = false end
+        end)
+    end
+end
+
+-- keep the menu fitting when the screen size / orientation changes
+do
+    local cam = workspace.CurrentCamera
+    if cam then
+        connect(cam:GetPropertyChangedSignal("ViewportSize"), function()
+            if opened then scale.Scale = baseScale() end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- floating icon (mobile: tap to open, drag to move)
+---------------------------------------------------------------------
+local cam0 = workspace.CurrentCamera
+local vp0 = cam0 and cam0.ViewportSize or Vector2.new(800, 600)
+
+local icon = new("TextButton", {
+    Name = "ToggleIcon",
+    Size = UDim2.fromOffset(IS_MOBILE and 58 or 50, IS_MOBILE and 58 or 50),
+    Position = UDim2.fromOffset(16, math.floor(vp0.Y * 0.35)),
+    BackgroundColor3 = THEME.bg,
+    AutoButtonColor = false,
+    Text = "aim",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+    ZIndex = 20,
+}, gui)
+corner(icon, 25)
+local iconStroke = new("UIStroke", {
+    Thickness = 2.5,
+    Color = Color3.new(1, 1, 1),
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, icon)
+local iconGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, iconStroke)
+
+local iconDown, iconMoved = false, false
+local iconStartIn, iconStartPos = nil, nil
+
+connect(icon.InputBegan, function(input)
+    if isPointer(input) then
+        iconDown = true
+        iconMoved = false
+        iconStartIn = input.Position
+        iconStartPos = icon.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if iconDown and isMove(input) then
+        local d = input.Position - iconStartIn
+        if d.Magnitude > 6 then
+            iconMoved = true
+        end
+        if iconMoved then
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+            local size = icon.AbsoluteSize
+            local x = math.clamp(iconStartPos.X.Offset + d.X, 0, vp.X - size.X)
+            local y = math.clamp(iconStartPos.Y.Offset + d.Y, 0, vp.Y - size.Y)
+            icon.Position = UDim2.fromOffset(x, y)
+        end
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if iconDown and isPointer(input) then
+        iconDown = false
+        if not iconMoved then
+            setOpen(not opened)
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- menu content
+---------------------------------------------------------------------
+addSection("Aim")
+
+addToggle("Aim enabled", AIM.enabled, function(v)
+    AIM.enabled = v
+    fovRefresh()
+    saveCfg()
+end, "aimtoggle")
+
+addSection("Target")
+
+addSegment({{"Bots", "Bot"}, {"Players", "Player"}, {"Both", "Both"}}, AIM.target, function(v)
+    AIM.target = v
+    saveCfg()
+end)
+
+addToggle("Wallbang (targets behind walls)", AIM.wallbang, function(v)
+    AIM.wallbang = v
+    saveCfg()
+end, "aimwallbang")
+
+addSection("FOV")
+
+addToggle("Show FOV circle", AIM.fovShow, function(v)
+    AIM.fovShow = v
+    fovRefresh()
+    saveCfg()
+end, "fovshow")
+
+addToggle("Aim only inside FOV", AIM.fovLimit, function(v)
+    AIM.fovLimit = v
+    saveCfg()
+end, "fovlimit")
+
+addSlider("FOV radius", 30, 600, AIM.fovRadius, function(v)
+    AIM.fovRadius = v
+    fovRefresh()
+end, saveCfg)
+
+addColorRow("FOV color")
+
+addSection("Status")
+
+local statusLabel = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 36),
+    BackgroundColor3 = THEME.item,
+    BorderSizePixel = 0,
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    TextColor3 = okHooks and THEME.accent2 or THEME.danger,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = hookStatus,
+    LayoutOrder = nextOrder(),
+}, page)
+corner(statusLabel, 8)
+new("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)}, statusLabel)
+
+addSection("Settings")
+
+addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
+    setOpen(not opened)
+end)
+
+addButton("Unload", function()
+    if env.__AimCleanup then env.__AimCleanup() end
+end)
+
+connect(closeBtn.Activated, function()
+    setOpen(false)
+end)
+
+if opened then tween(scale, {Scale = baseScale()}, 0.5, Enum.EasingStyle.Back) end
+
+---------------------------------------------------------------------
+-- dragging (menu window; mouse and touch)
+---------------------------------------------------------------------
+local dragging, dragStart, startPos = false, nil, nil
+
+connect(topbar.InputBegan, function(input)
+    if isPointer(input) then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if dragging and isMove(input) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if isPointer(input) then
+        dragging = false
+    end
+end)
+
+connect(RunService.RenderStepped, function()
+    local rot = (os.clock() * 80) % 360
+    strokeGrad.Rotation = rot
+    iconGrad.Rotation = rot
+
+    -- while the menu is open the cursor is visible and unlocked (PC)
+    if opened and not IS_MOBILE then
+        mouseRelease()
+        if not UserInputService.MouseIconEnabled then
+            UserInputService.MouseIconEnabled = true
+        end
+        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- unload (the hooks stay installed but pass everything through once AIM.enabled is false)
+---------------------------------------------------------------------
+env.__AimCleanup = function()
+    saveCfg()
+    AIM.enabled = false
+    pcall(mouseRestore)
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    gui:Destroy()
+    env.__AimCleanup = nil
+end
+end
+
+local okUI, errUI = xpcall(buildUI, function(e)
+    return tostring(e)
+end)
+if okUI then
+    notify("aim", IS_MOBILE and "menu loaded: tap the round 'aim' icon" or "menu loaded: press K")
+else
+    pcall(warn, "[aim] menu error: " .. tostring(errUI))
+    notify("aim: menu error", string.sub(tostring(errUI), 1, 200))
+end
